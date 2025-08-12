@@ -1,5 +1,43 @@
 #!/usr/bin/env python3
 
+def make_npz_archive(npz_root: str, archive_path: str) -> str:
+    """
+    Pack all .npz files under `npz_root` into a single .tar.gz at `archive_path`.
+    Returns the archive path.
+    """
+    npz_root = Path(npz_root)
+    archive_path = Path(archive_path)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for f in npz_root.rglob("*.npz"):
+            tar.add(f, arcname=f.relative_to(npz_root))
+    return str(archive_path)
+
+
+def open_npz_from_archive(archive_path: str, target_name: str):
+    """
+    Open a single .npz by (base)name from a .tar.gz archive without extracting all files.
+    Returns a dict-like NpzFile object (use with `with` or remember to close).
+    `target_name` can be "12345.npz" (basename) or a relative path inside the archive.
+    """
+    import numpy as np
+
+    with tarfile.open(archive_path, "r:gz") as tar:
+        # First try exact relative path match; else fallback to basename match
+        member = tar.getmember(target_name) if target_name in tar.getnames() else None
+        if member is None:
+            # basename fallback
+            member = next((m for m in tar.getmembers() if m.name.endswith("/" + target_name) or m.name == target_name), None)
+        if member is None:
+            raise FileNotFoundError(f"{target_name} not found in {archive_path}")
+
+        fobj = tar.extractfile(member)
+        if fobj is None:
+            raise IOError(f"Could not extract file-like object for {member.name}")
+        # NOTE: caller should read/convert results immediately since fobj will close after 'with'
+        return np.load(fobj)
+
 """Gemma-3n FLEURS ASR."""
 
 import argparse
