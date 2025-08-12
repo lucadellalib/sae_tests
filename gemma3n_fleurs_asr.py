@@ -149,27 +149,24 @@ def main():
     ds = ds.cast_column("audio", Audio(sampling_rate=args.resample_hz))
     print("Loaded dataset!")
 
+    dataloader = torch.utils.data.DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        collate_fn=lambda batch: {
+            "audio": [b["audio"] for b in batch],
+            "ref": [b["transcription"] for b in batch],
+            "id": [b["id"] for b in batch],
+        },
+        num_workers=0,  # keep 0 unless you need multiprocessing
+        pin_memory=False,
+    )
+
     rows = []
-    batch_audio, batch_refs, batch_ids = [], [], []
-    pbar = tqdm(desc="Batches (streaming)")
-
-    for ex in ds:
-        batch_audio.append(ex["audio"])
-        batch_refs.append(ex["transcription"])
-        batch_ids.append(ex["id"])
-
-        if len(batch_audio) == args.batch_size:
-            run_batch(processor, model, args, batch_audio, batch_refs, batch_ids, rows)
-            batch_audio.clear()
-            batch_refs.clear()
-            batch_ids.clear()
-            pbar.update(1)
-
-    if batch_audio:
+    for batch in tqdm(dataloader, desc="Batches (DataLoader)"):
+        batch_audio = batch["audio"]
+        batch_refs = batch["ref"]
+        batch_ids = batch["id"]
         run_batch(processor, model, args, batch_audio, batch_refs, batch_ids, rows)
-        pbar.update(1)
-
-    pbar.close()
 
     # Overall WER & CER
     overall_wer = compute_wer([r["ref"] for r in rows], [r["hyp"] for r in rows])
