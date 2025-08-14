@@ -1,56 +1,29 @@
-#!/usr/bin/env python3
+"""Gemma 3n FLEURS ASR (ABSL version)."""
 
-def make_npz_archive(npz_root: str, archive_path: str) -> str:
-    """
-    Pack all .npz files under `npz_root` into a single .tar.gz at `archive_path`.
-    Returns the archive path.
-    """
-    npz_root = Path(npz_root)
-    archive_path = Path(archive_path)
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with tarfile.open(archive_path, "w:gz") as tar:
-        for f in npz_root.rglob("*.npz"):
-            tar.add(f, arcname=f.relative_to(npz_root))
-    return str(archive_path)
-
-
-def open_npz_from_archive(archive_path: str, target_name: str):
-    """
-    Open a single .npz by (base)name from a .tar.gz archive without extracting all files.
-    Returns a dict-like NpzFile object (use with `with` or remember to close).
-    `target_name` can be "12345.npz" (basename) or a relative path inside the archive.
-    """
-    import numpy as np
-
-    with tarfile.open(archive_path, "r:gz") as tar:
-        # First try exact relative path match; else fallback to basename match
-        member = tar.getmember(target_name) if target_name in tar.getnames() else None
-        if member is None:
-            # basename fallback
-            member = next((m for m in tar.getmembers() if m.name.endswith("/" + target_name) or m.name == target_name), None)
-        if member is None:
-            raise FileNotFoundError(f"{target_name} not found in {archive_path}")
-
-        fobj = tar.extractfile(member)
-        if fobj is None:
-            raise IOError(f"Could not extract file-like object for {member.name}")
-        # NOTE: caller should read/convert results immediately since fobj will close after 'with'
-        return np.load(fobj)
-
-"""Gemma-3n FLEURS ASR."""
-
-import argparse
 import os
-
-import jiwer
 import numpy as np
 import pandas as pd
 import torch
 from datasets import Audio, load_dataset
-from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
+from absl import app, flags, logging
+import jiwer
+from tqdm import tqdm
+
+# ---------------------------
+# Flags
+# ---------------------------
+FLAGS = flags.FLAGS
+flags.DEFINE_string("model_id", "google/gemma-3n-E2B-it", "Model identifier")
+flags.DEFINE_string("lang", "en_us", "FLEURS language code (e.g., en_us)")
+flags.DEFINE_string("split", "test", "Dataset split (e.g., 'test', 'test[:200]')")
+flags.DEFINE_integer("resample_hz", 16000, "Target sample rate for audio")
+flags.DEFINE_integer("batch_size", 4, "Batch size for inference")
+flags.DEFINE_integer("max_new_tokens", 512, "Maximum new tokens to generate")
+flags.DEFINE_string("prompt", "Transcribe this audio", "Transcription prompt")
+flags.DEFINE_integer("layer_idx", -1, "Decoder layer index for hidden-states dump")
+flags.DEFINE_string("output_dir", "gemma3n_fleurs_en_us", "Output directory")
 
 # ---------------------------
 # Helpers
@@ -58,12 +31,10 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 def compute_wer(refs, hyps):
     return 100 * float(jiwer.wer(refs, hyps))
 
-
 def compute_cer(refs, hyps):
     return 100 * float(jiwer.cer(refs, hyps))
 
-
-def normalize_text(s):
+def normalize_text(s: str):
     transform = jiwer.Compose(
         [
             jiwer.ToLowerCase(),
@@ -76,24 +47,32 @@ def normalize_text(s):
     )
     return transform(s)
 
-
-def make_messages_batch(audio_batch, user_prompt):
+def make_messages_batch(audio_batch, user_prompt: str):
+    """
+    audio_batch: list of dicts, each like {"array": np.ndarray, "sampling_rate": int, ...}
+    Returns a list of conversations (one turn each), ready for apply_chat_template.
+    """
     msgs = []
     for x in audio_batch:
-        msg = {
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio": x["array"]},
-                {"type": "text", "text": user_prompt},
-            ],
-        }
-        msgs.append([msg])
+        msgs.append(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "audio": x["array"]},
+                        {"type": "text", "text": user_prompt},
+                    ],
+                }
+            ]
+        )
     return msgs
 
+@torch.no_grad()
+def run_batch(processor, model, batch_audio, batch_refs, batch_ids, rows):
+    # Build chat messages for this batch (directly with arrays)
+    messages = make_messages_batch(batch_audio, FLAGS.prompt)
 
-def run_batch(processor, model, args, batch_audio, batch_refs, batch_ids, rows):
-    messages = make_messages_batch(batch_audio, args.prompt)
-
+    # Tokenize via chat template
     inputs = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -101,36 +80,35 @@ def run_batch(processor, model, args, batch_audio, batch_refs, batch_ids, rows):
         return_dict=True,
         return_tensors="pt",
     )
-    inputs = inputs.to(model.device, dtype=model.dtype)
+    # Move tensors to model device (keep integer dtypes intact)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
+    # Forward generate with decoder hidden states
     outputs = model.generate(
         **inputs,
-        max_new_tokens=args.max_new_tokens,
+        max_new_tokens=FLAGS.max_new_tokens,
         return_dict_in_generate=True,
         output_hidden_states=True,
         output_attentions=False,
     )
 
-    hidden_states = torch.cat([torch.stack(x) for x in outputs.hidden_states], dim=-2)
-    hidden_states = hidden_states.movedim(1, -2).flatten(start_dim=-2).movedim(0, -1)
-    lengths = (
-        (outputs.sequences != processor.tokenizer.pad_token_id).sum(dim=1) - 1
-    ).long()
+    # Store decoder hidden states (see modeling_gemma3n.py notes in your original)
+    hidden_states = torch.cat([x[FLAGS.layer_idx] for x in outputs.hidden_states], dim=-2)
+    hidden_states = hidden_states.movedim(0, -2).flatten(start_dim=-2)
+    lengths = ((outputs.sequences != processor.tokenizer.pad_token_id).sum(dim=1) - 1).long()
     batch_hidden_states = [x[:l] for x, l in zip(hidden_states, lengths)]
-    prompt_lengths = (
-        (inputs["input_ids"] != processor.tokenizer.pad_token_id).sum(dim=1)
-    ).long()
+    prompt_lengths = ((inputs["input_ids"] != processor.tokenizer.pad_token_id).sum(dim=1)).long()
 
+    # Decode (assistant-only thanks to chat template)
     batch_texts = processor.batch_decode(
         outputs.sequences,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=True,
     )
-    batch_texts = [
-        x.replace(f"user\n\n\n\n\n{args.prompt}\nmodel\n", "") for x in batch_texts
-    ]
+    # Guard in case the model ever echoes the prompt header
+    batch_texts = [x.replace(f"user\n\n\n\n\n{FLAGS.prompt}\nmodel\n", "") for x in batch_texts]
 
-    # Per-utterance WER + CER
+    # Collect normalized refs/hyps with per-utt WER/CER
     for uid, ref, hyp in zip(batch_ids, batch_refs, batch_texts):
         ref = normalize_text(ref)
         hyp = normalize_text(hyp)
@@ -144,79 +122,70 @@ def run_batch(processor, model, args, batch_audio, batch_refs, batch_ids, rows):
             }
         )
 
+    # Dump hidden states per utterance
     for i, uid in enumerate(batch_ids):
-        output_dir = os.path.join(args.output_dir, args.lang, "data")
-        os.makedirs(output_dir, exist_ok=True)
+        out_dir = os.path.join(FLAGS.output_dir, "data", f"layer={FLAGS.layer_idx}")
+        os.makedirs(out_dir, exist_ok=True)
         np.savez_compressed(
-            os.path.join(output_dir, f"{uid}.npz"),
+            os.path.join(out_dir, f"{uid}.npz"),
             token_ids=outputs.sequences[i][: lengths[i] + 1].cpu().numpy(),
             hidden_states=batch_hidden_states[i].float().cpu().numpy(),
             prompt_length=int(prompt_lengths[i].cpu().numpy()),
         )
 
-
 @torch.no_grad()
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_id", default="google/gemma-3n-E2B-it")
-    parser.add_argument(
-        "--lang", default="en_us", help="FLEURS language code (e.g., en_us)"
-    )
-    parser.add_argument(
-        "--split", default="test", help="Dataset split (e.g., 'test', 'test[:200]')"
-    )
-    parser.add_argument(
-        "--resample_hz", type=int, default=16000, help="Target sample rate for audio"
-    )
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--prompt", default="Transcribe this audio")
-    parser.add_argument("--output_dir", default="gemma3n_e2b_fleurs")
-    args, *_ = parser.parse_known_args()
-
-    processor = AutoProcessor.from_pretrained(args.model_id)
+def main(_argv):
+    # Model & processor
+    processor = AutoProcessor.from_pretrained(FLAGS.model_id)
     model = AutoModelForImageTextToText.from_pretrained(
-        args.model_id,
+        FLAGS.model_id,
         torch_dtype="auto",
         device_map="auto",
     )
     model.eval()
-    print("Loaded model!")
+    logging.info("Loaded model %s", FLAGS.model_id)
 
-    ds = load_dataset("google/fleurs", args.lang, split=args.split, streaming=True)
-    ds = ds.cast_column("audio", Audio(sampling_rate=args.resample_hz))
-    print("Loaded dataset!")
-
-    dataloader = torch.utils.data.DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        collate_fn=lambda batch: {
-            "audio": [b["audio"] for b in batch],
-            "ref": [b["transcription"] for b in batch],
-            "id": [b["id"] for b in batch],
-        },
-        num_workers=0,  # keep 0 unless you need multiprocessing
-        pin_memory=False,
-    )
+    # FLEURS (streaming + resample)
+    ds = load_dataset("google/fleurs", FLAGS.lang, split=FLAGS.split, streaming=True)
+    ds = ds.cast_column("audio", Audio(sampling_rate=FLAGS.resample_hz))
 
     rows = []
-    for batch in tqdm(dataloader, desc="Batches (DataLoader)"):
-        batch_audio = batch["audio"]
-        batch_refs = batch["ref"]
-        batch_ids = batch["id"]
-        run_batch(processor, model, args, batch_audio, batch_refs, batch_ids, rows)
+    batch_audio, batch_refs, batch_ids = [], [], []
+    pbar = tqdm(desc="Batches (streaming)")
 
-    # Overall WER & CER
+    for ex in ds:
+        a = ex["audio"]           # {"array": np.ndarray, "sampling_rate": int, ...}
+        r = ex["transcription"]   # reference text
+        uid = ex.get("id", None)
+
+        batch_audio.append(a)
+        batch_refs.append(r)
+        batch_ids.append(uid)
+
+        if len(batch_audio) == FLAGS.batch_size:
+            run_batch(processor, model, batch_audio, batch_refs, batch_ids, rows)
+            batch_audio.clear(); batch_refs.clear(); batch_ids.clear()
+            pbar.update(1)
+
+    # Flush final partial batch
+    if batch_audio:
+        run_batch(processor, model, batch_audio, batch_refs, batch_ids, rows)
+        pbar.update(1)
+
+    pbar.close()
+
+    # Overall WER & CER (micro-avg with jiwer’s corpus functions)
     overall_wer = compute_wer([r["ref"] for r in rows], [r["hyp"] for r in rows])
     overall_cer = compute_cer([r["ref"] for r in rows], [r["hyp"] for r in rows])
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    out_csv = os.path.join(args.output_dir, args.lang, "metadata.csv")
+    # Save
+    os.makedirs(FLAGS.output_dir, exist_ok=True)
+    out_csv = os.path.join(FLAGS.output_dir, "metadata.csv")
     pd.DataFrame(rows).to_csv(out_csv, index=False)
+
     print(f"\nSaved: {out_csv}")
     print(f"WER: {overall_wer:.4f}")
     print(f"CER: {overall_cer:.4f}")
 
-
 if __name__ == "__main__":
-    main()
+    app.run(main)
