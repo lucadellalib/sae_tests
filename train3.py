@@ -1,3 +1,82 @@
+def encode(self, x: torch.Tensor) -> torch.Tensor:
+    z = (x - self.b) @ self.W
+    z = torch.relu(z)
+    if self.topk is not None and 0 < self.topk < z.shape[1]:
+        # old:
+        # vals, idx = torch.topk(z, self.topk, dim=1)
+        # mask = torch.zeros_like(z).scatter(1, idx, 1.0)
+        # z = z * mask
+        # new (ghost grads):
+        z = topk_with_ghost(z, self.topk, ghost_k=8, gamma=0.1, tau=0.5, mode="nextk")
+    return z
+
+
+
+import torch
+
+class TopKGhost(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, z, k: int, ghost_k: int, gamma: float, tau: float, mode: str):
+        """
+        z: pre-activation after ReLU, shape [B, Kfeat]
+        k: keep this many active features
+        ghost_k: number of 'next-best' features to receive ghost grad (only for mode='nextk')
+        gamma: ghost grad scale (0..1)
+        tau: temperature for softmax mode
+        mode: 'nextk' or 'softmax'
+        """
+        B, Kfeat = z.shape
+        vals, idx = torch.topk(z, k, dim=1)
+        mask = torch.zeros_like(z).scatter(1, idx, 1.0)
+        y = z * mask  # hard Top-K in forward
+
+        ctx.save_for_backward(z, mask, idx)
+        ctx.k = k
+        ctx.ghost_k = ghost_k
+        ctx.gamma = gamma
+        ctx.tau = tau
+        ctx.mode = mode
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        z, mask, idx_top = ctx.saved_tensors
+        k, ghost_k, gamma, tau, mode = ctx.k, ctx.ghost_k, ctx.gamma, ctx.tau, ctx.mode
+
+        # Base: Top-K get full gradient
+        grad_in = grad_out * mask
+
+        if gamma > 0:
+            if mode == "nextk":
+                # give scaled gradient to next ghost_k by preactivation
+                # compute ranks by sorting descending
+                vals_all, idx_all = torch.sort(z, dim=1, descending=True)
+                if ghost_k > 0:
+                    ghost_idx = idx_all[:, k:k+ghost_k]  # [B, ghost_k]
+                    ghost_mask = torch.zeros_like(z).scatter(1, ghost_idx, 1.0)
+                    grad_in = grad_in + gamma * (grad_out * ghost_mask)
+            elif mode == "softmax":
+                # distribute a small fraction to everyone proportional to softmax
+                w = torch.softmax(z / max(tau, 1e-6), dim=1)
+                # but remove the Top-K (already have full grad) to avoid double counting
+                w = w * (1.0 - mask)
+                # normalize ghost mass to 1 per row then scale by gamma
+                denom = w.sum(dim=1, keepdim=True).clamp_min(1e-12)
+                w = (w / denom)
+                grad_in = grad_in + gamma * (grad_out * w)
+        return grad_in, None, None, None, None, None
+
+
+def topk_with_ghost(z, k: int, *, ghost_k: int = 8, gamma: float = 0.1, tau: float = 0.5, mode: str = "nextk"):
+    """
+    Convenience wrapper. z: [B, Kfeat], already ReLU'ed.
+    Returns: masked codes with hard Top-K forward, ghosted gradients in backward.
+    """
+    return TopKGhost.apply(z, k, ghost_k, gamma, tau, mode)
+
+
+
+
 # sae_streaming_all.py
 # Python 3.10+, PyTorch 2.x
 
