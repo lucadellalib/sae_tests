@@ -1,3 +1,271 @@
+# sae_deterministic_lottery_monitor.py
+import os, math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# ---------------------------
+# Model (W: [d_in, k], atoms are columns)
+# ---------------------------
+
+class SoftThreshold(nn.Module):
+    def __init__(self, lam: float): super().__init__(); self.lam = float(lam)
+    def forward(self, x): return torch.sign(x) * F.relu(x.abs() - self.lam)
+
+class SAE(nn.Module):
+    """
+    Sparse AE with tied weights and tied bias:
+      - Encode:  z = S_lambda(x @ W + b_e)      (W: [d_in, k], b_e: [k])
+      - Decode:  x̂ = z @ W^T + b_d,  b_d = - W @ b_e   (derived each forward)
+    Atoms are the columns of W; we keep columns unit-norm.
+    """
+    def __init__(self, d_in: int, k: int, lam: float = 0.1):
+        super().__init__()
+        self.d_in, self.k = d_in, k
+        self.W   = nn.Parameter(torch.randn(d_in, k) / math.sqrt(d_in))
+        self.b_e = nn.Parameter(torch.zeros(k))
+        self.act = SoftThreshold(lam)
+        with torch.no_grad(): self.renorm_atoms_columns()
+
+    def encode(self, x):  # x: [B, d_in] -> z: [B, k]
+        pre = x @ self.W + self.b_e
+        return self.act(pre)
+
+    def decode(self, z):  # z: [B, k] -> x̂: [B, d_in]
+        b_d = -(self.W @ self.b_e)  # tied/derived
+        return z @ self.W.t() + b_d
+
+    def forward(self, x):
+        z = self.encode(x)
+        xhat = self.decode(z)
+        return xhat, z
+
+    @torch.no_grad()
+    def renorm_atoms_columns(self, eps: float = 1e-8):
+        # Ensure each atom (column) has unit norm
+        coln = self.W.norm(dim=0, keepdim=True).clamp_min(eps)  # [1, k]
+        self.W.div_(coln)
+
+    @torch.no_grad()
+    def lottery_reinit_deterministic_cols(self, idx: torch.LongTensor, optimizer=None, seed: int | None = None):
+        """
+        Deterministic lottery reinit on ALL ranks:
+          1) rank0 broadcasts (idx, seed)
+          2) every rank generates identical random unit columns for W[:, idx]
+          3) b_e[idx] gets small random noise
+          4) zero optimizer state slices for those columns/elements
+        """
+        if idx is None or idx.numel() == 0:
+            if dist.is_initialized(): dist.barrier()
+            return
+
+        device = self.W.device
+        # ---- sync idx + seed (tiny metadata) ----
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                seed = int(torch.empty((), dtype=torch.int64).random_().item() if seed is None else seed)
+                payload = [idx.detach().cpu(), seed]
+            else:
+                payload = [torch.empty_like(idx.detach().cpu()), 0]
+            dist.broadcast_object_list(payload, src=0)
+            idx_cpu, seed = payload
+            idx = idx_cpu.to(device)
+        else:
+            seed = int(torch.empty((), dtype=torch.int64).random_().item() if seed is None else seed)
+
+        # ---- generate identical atoms on every rank ----
+        d_in, K = self.W.size(0), idx.numel()
+        g = torch.Generator(device=device).manual_seed(seed)
+        atoms = torch.randn(d_in, K, generator=g, device=device)
+        atoms = atoms / atoms.norm(dim=0, keepdim=True).clamp_min(1e-8)
+
+        # ---- write columns + small lottery bias; enforce unit norms ----
+        self.W[:, idx] = atoms
+        self.b_e[idx].normal_(mean=0.0, std=1e-3)
+        # (columns already unit, but keep strict)
+        self.renorm_atoms_columns()
+
+        # ---- zero optimizer state ONLY for touched slices ----
+        if optimizer is not None:
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    st = optimizer.state.get(p, None)
+                    if not st: continue
+                    if p is self.W:
+                        for v in list(st.values()):
+                            if isinstance(v, torch.Tensor) and v.ndim == 2 and v.shape == self.W.shape:
+                                v[:, idx].zero_()
+                    elif p is self.b_e:
+                        for v in list(st.values()):
+                            if isinstance(v, torch.Tensor) and v.ndim == 1 and v.shape == self.b_e.shape:
+                                v[idx].zero_()
+
+        if dist.is_initialized(): dist.barrier()
+
+# ---------------------------
+# Firing-rate monitor + dead selection (patience/cap/cooldown)
+# ---------------------------
+
+@torch.no_grad()
+def epoch_firing_rate(model: SAE, loader: DataLoader, device, tau: float = 1e-6):
+    model.eval()
+    k = model.k
+    count = torch.zeros(k, device=device)
+    total = 0
+    for x in loader:
+        x = x.to(device)
+        _, z = model(x)
+        count += (z.abs() > tau).float().sum(dim=0)
+        total += z.size(0)
+    return (count / max(total, 1)).clamp_(0, 1)
+
+def pick_dead(
+    firing_rate: torch.Tensor,
+    thr: float = 0.01,
+    patience: int = 2,
+    max_frac: float = 0.02,
+    dead_epochs: torch.Tensor | None = None,
+    cooldown: torch.Tensor | None = None,
+):
+    """
+    Hysteresis + cap + cooldown.
+    Returns (chosen_idx, dead_epochs, cooldown).
+    """
+    device = firing_rate.device
+    if dead_epochs is None or cooldown is None:
+        dead_epochs = torch.zeros_like(firing_rate, dtype=torch.int64, device=device)
+        cooldown    = torch.zeros_like(dead_epochs)
+
+    active = firing_rate >= thr
+    newly_dead = ~active & (cooldown == 0)
+    dead_epochs[newly_dead] += 1
+    dead_epochs[active] = 0
+
+    candidates = (dead_epochs >= patience).nonzero(as_tuple=False).flatten()
+    if candidates.numel() == 0:
+        cooldown[cooldown > 0] -= 1
+        return candidates, dead_epochs, cooldown
+
+    kmax = max(1, int(max_frac * firing_rate.numel()))
+    chosen = candidates[torch.randperm(candidates.numel(), device=device)[:kmax]]
+    cooldown[chosen] = 2
+    cooldown[cooldown > 0] -= 1
+    return chosen, dead_epochs, cooldown
+
+# ---------------------------
+# Toy data (replace with your dataset)
+# ---------------------------
+
+class ToyGaussian(Dataset):
+    def __init__(self, n=50000, d=128, centers=5, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        means = torch.randn(centers, d, generator=g)
+        xs = []
+        for _ in range(n):
+            c = int(torch.randint(0, centers, (1,), generator=g))
+            xs.append(means[c] + 0.3 * torch.randn(d, generator=g))
+        self.data = torch.stack(xs)
+    def __len__(self): return self.data.size(0)
+    def __getitem__(self, i): return self.data[i]
+
+# ---------------------------
+# DDP helpers
+# ---------------------------
+
+def ddp_setup():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"]); world = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank if torch.cuda.is_available() else 0)
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        return rank, world, local_rank
+    return 0, 1, 0
+
+def ddp_cleanup():
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+# ---------------------------
+# Training
+# ---------------------------
+
+def main():
+    rank, world, local_rank = ddp_setup()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    is_master = (rank == 0)
+
+    d_in, k = 128, 1024
+    lam = 0.1
+
+    train_set = ToyGaussian(n=20000, d=d_in, centers=6, seed=123)
+    val_set   = ToyGaussian(n=4000,  d=d_in, centers=6, seed=456)
+
+    train_sampler = DistributedSampler(train_set, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
+    val_sampler   = DistributedSampler(val_set,   num_replicas=world, rank=rank, shuffle=False) if world > 1 else None
+
+    train_loader = DataLoader(train_set, batch_size=256, sampler=train_sampler, shuffle=(train_sampler is None), drop_last=True)
+    val_loader   = DataLoader(val_set,   batch_size=512, sampler=val_sampler,   shuffle=False)
+
+    model = SAE(d_in, k, lam=lam).to(device)
+    wrapped = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, find_unused_parameters=False) if world > 1 else model
+    opt = torch.optim.Adam(wrapped.parameters(), lr=2e-3)
+
+    # Track deadness across epochs (lives on device)
+    dead_epochs = torch.zeros(k, dtype=torch.int64, device=device)
+    cooldown    = torch.zeros_like(dead_epochs)
+
+    epochs = 10
+    warmup_epochs = 1
+    for ep in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(ep)
+
+        wrapped.train()
+        for x in train_loader:
+            x = x.to(device)
+            xhat, z = wrapped(x)
+            recon = F.mse_loss(xhat, x, reduction='mean')
+            l1 = z.abs().mean()
+            loss = recon + 1e-3 * l1
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            # keep atoms unit-norm
+            (wrapped.module if isinstance(wrapped, DDP) else wrapped).renorm_atoms_columns()
+
+        # ---- End of epoch: monitor + deterministic lottery reinit ----
+        torch.cuda.synchronize(device) if torch.cuda.is_available() else None
+
+        core = wrapped.module if isinstance(wrapped, DDP) else wrapped
+        fr = epoch_firing_rate(core, val_loader, device, tau=1e-6)
+        to_reset, dead_epochs, cooldown = pick_dead(
+            fr, thr=0.01, patience=2, max_frac=0.02, dead_epochs=dead_epochs, cooldown=cooldown
+        )
+
+        if ep > warmup_epochs and to_reset.numel() > 0:
+            core.lottery_reinit_deterministic_cols(idx=to_reset, optimizer=opt)
+            # Optional: reset counters for those units
+            dead_epochs[to_reset] = 0
+
+        if is_master:
+            print(f"[Epoch {ep}] loss≈{loss.item():.4f} | FR<1%: {(fr<0.01).sum().item()} | reinit {to_reset.numel()} units")
+
+        if dist.is_initialized():
+            dist.barrier()
+
+    ddp_cleanup()
+
+if __name__ == "__main__":
+    main()
+
+
+
 """Train hallucination detection model."""
 
 import logging
